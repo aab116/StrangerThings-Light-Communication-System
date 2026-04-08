@@ -1,5 +1,5 @@
-/* ps2_keyboard.c */
 #include "ps2_keyboard.h"
+#include "speaker.h"
 
 // ==========================================================
 // PS/2 connections
@@ -52,6 +52,18 @@ static volatile uint32_t ledStateMask = 0U;
 // Flicker mode state
 static volatile uint8_t flickerModeEnabled = 0U;
 static volatile uint8_t flickerPhaseOn = 0U;
+
+static volatile uint8_t flickerTickDivider = 0U;
+static volatile uint8_t soundPatternIndex = 0U;
+
+static volatile uint8_t buttonTriggerActive = 0U;
+static volatile uint8_t runSequenceState = 0U;
+
+static volatile uint8_t runSpeakerActive = 0U;
+static volatile uint8_t runLightsActive = 0U;
+static volatile uint8_t runLightsPending = 0U;
+static volatile uint16_t runLightsDelayTicks = 0U;
+
 
 // ----------------------------------------------------------
 // Configure a GPIO pin as push-pull output at 2 MHz
@@ -291,6 +303,19 @@ static void PS2_GPIO_EXTI_Init(void)
     NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
+
+
+void PS2_SetButtonTrigger(uint8_t pressed)
+{
+    buttonTriggerActive = pressed ? 1U : 0U;
+
+    if (buttonTriggerActive)
+    {
+        runSequenceState = 0U;
+    }
+}
+
+
 // ----------------------------------------------------------
 // Process one fully received PS/2 byte
 //
@@ -303,39 +328,91 @@ static void PS2_ProcessByte(uint8_t byte)
 {
     int8_t ledIndex;
 
-    // Extended scan code prefix
+    /* Extended scan code prefix */
     if (byte == 0xE0)
     {
         ps2ExtendedCode = 1U;
         return;
     }
 
-    // Break code prefix (key release)
+    /* Break code prefix (key release) */
     if (byte == 0xF0)
     {
         ps2BreakCode = 1U;
         return;
     }
 
-    // Ignore extended keys for now
+    /* Ignore extended keys for now */
     if (!ps2ExtendedCode)
     {
+        /* ESC key (PS/2 Set 2 = 0x76)
+           Only stop the RUN-triggered scare mode.
+           If the pushbutton is still active, the effect stays on. */
+        if (!ps2BreakCode && byte == 0x76U)
+        {
+            
+           // ESC cancels the RUN-triggered effect
+						runSpeakerActive = 0U;
+						runLightsActive = 0U;
+						runLightsPending = 0U;
+						runLightsDelayTicks = 0U;
+						runSequenceState = 0U;
+            
+        }
+
+				if (buttonTriggerActive)
+{
+    runSequenceState = 0U;
+}
+        /* Detect R -> U -> N on key press only */
+/* Detect R -> U -> N on key press only,
+   but ONLY when the pushbutton is not currently active */
+if (!ps2BreakCode && !buttonTriggerActive)
+{
+    if (byte == 0x2DU)          /* R */
+    {
+        runSequenceState = 1U;
+    }
+    else if ((byte == 0x3CU) && (runSequenceState == 1U))   /* U */
+    {
+        runSequenceState = 2U;
+    }
+    else if ((byte == 0x31U) && (runSequenceState == 2U))   /* N */
+    {
+			runSpeakerActive = 1U;         // speaker starts now
+			runLightsActive = 0U;          // lights still off
+			runLightsPending = 1U;         // waiting to start lights
+			runLightsDelayTicks = 250U;    // 5 seconds at 20 ms/tick
+			runSequenceState = 0U;
+			
+    }
+    else if (byte != 0x76U)
+    {				
+			runSpeakerActive = 0U;
+			runLightsActive = 0U;
+			runLightsPending = 0U;
+			runLightsDelayTicks = 0U;
+			runSequenceState = 0U;
+				
+    }
+}
+
         ledIndex = ScanCode_ToIndex(byte);
 
         if (ledIndex >= 0)
         {
             if (ps2BreakCode)
             {
-                // Key released -> clear bit
+                /* Key released -> clear bit */
                 ledStateMask &= ~(1UL << (uint32_t)ledIndex);
             }
             else
             {
-                // Key pressed -> set bit
+                /* Key pressed -> set bit */
                 ledStateMask |= (1UL << (uint32_t)ledIndex);
             }
 
-            // Only apply directly when flicker mode is not active
+            /* Only apply directly when flicker mode is not active */
             if (!flickerModeEnabled)
             {
                 LED_ApplyMask(ledStateMask);
@@ -343,7 +420,7 @@ static void PS2_ProcessByte(uint8_t byte)
         }
     }
 
-    // Clear prefixes after handling this byte
+    /* Clear prefixes after handling this byte */
     ps2BreakCode = 0U;
     ps2ExtendedCode = 0U;
 }
@@ -358,7 +435,7 @@ void PS2_Keyboard_Init(void)
 
     // SysTick used for flicker timing
     SystemCoreClockUpdate();
-    SysTick_Config(SystemCoreClock / 10U);   // 100 ms period
+    SysTick_Config(SystemCoreClock / 50U);   // 20 ms period
 }
 
 // ----------------------------------------------------------
@@ -373,12 +450,22 @@ void PS2_SetFlickerMode(uint8_t enable)
     {
         flickerModeEnabled = 1U;
         flickerPhaseOn = 1U;
+        flickerTickDivider = 0U;
+        soundPatternIndex = 0U;
+
+        Speaker_SetTone(180U);
+        Speaker_On();
+
         LED_All_On();
     }
     else
     {
         flickerModeEnabled = 0U;
         flickerPhaseOn = 0U;
+        flickerTickDivider = 0U;
+        soundPatternIndex = 0U;
+
+        Speaker_Off();
         LED_ApplyMask(ledStateMask);
     }
 }
@@ -388,18 +475,184 @@ void PS2_SetFlickerMode(uint8_t enable)
 // ----------------------------------------------------------
 void SysTick_Handler(void)
 {
-    if (flickerModeEnabled)
-    {
-        flickerPhaseOn ^= 1U;
+    // Keeps track of how long the scary sound has been running
+    static uint16_t scaryTick = 0U;
 
-        if (flickerPhaseOn)
+    // Current tone to send to the speaker
+    uint32_t tone = 420U;
+
+    // Controls whether this tick should output sound or insert a creepy gap
+    uint8_t makeSound = 1U;
+
+    // These decide whether sound and lights should be active right now
+    uint8_t soundEnabled;
+    uint8_t lightsEnabled;
+
+    // Creepy sound patterns
+    static const uint16_t whisperBand[] =
+    {
+        420, 480, 390, 520, 440, 560, 410, 500
+    };
+
+    static const uint16_t eerieRise[] =
+    {
+        620, 710, 680, 790, 740, 860, 720, 910
+    };
+
+    static const uint16_t highWail[] =
+    {
+        980, 1120, 1040, 1180, 1010, 1150, 1070, 1210
+    };
+
+    // ----------------------------------------------------------
+    // RUN behavior:
+    // Speaker starts immediately when RUN is triggered.
+    // Lights start 5 seconds later.
+    // ----------------------------------------------------------
+    if (runLightsPending)
+    {
+        if (runLightsDelayTicks > 0U)
         {
-            LED_All_On();
+            runLightsDelayTicks--;
+        }
+
+        if (runLightsDelayTicks == 0U)
+        {
+            runLightsPending = 0U;
+            runLightsActive = 1U;
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Button does BOTH immediately.
+    // RUN does speaker immediately, lights only after delay.
+    // ----------------------------------------------------------
+    soundEnabled  = (buttonTriggerActive || runSpeakerActive) ? 1U : 0U;
+    lightsEnabled = (buttonTriggerActive || runLightsActive)  ? 1U : 0U;
+
+    // ----------------------------------------------------------
+    // SOUND SECTION
+    // ----------------------------------------------------------
+    if (soundEnabled)
+    {
+        // Phase 1: stuttery creepy start
+        if (scaryTick < 18U)
+        {
+            tone = whisperBand[soundPatternIndex];
+            soundPatternIndex++;
+            if (soundPatternIndex >= (sizeof(whisperBand) / sizeof(whisperBand[0])))
+            {
+                soundPatternIndex = 0U;
+            }
+
+            // Brief gaps make it feel haunted
+            if ((scaryTick % 3U) == 0U)
+            {
+                makeSound = 0U;
+            }
+        }
+        // Phase 2: unstable climb
+        else if (scaryTick < 45U)
+        {
+            tone = eerieRise[soundPatternIndex];
+            soundPatternIndex++;
+            if (soundPatternIndex >= (sizeof(eerieRise) / sizeof(eerieRise[0])))
+            {
+                soundPatternIndex = 0U;
+            }
+
+            // Add wobble so it sounds less clean
+            if ((scaryTick % 5U) == 2U)
+            {
+                tone += 120U;
+            }
+            else if ((scaryTick % 5U) == 4U)
+            {
+                tone -= 70U;
+            }
+
+            // Small silent gaps for creepiness
+            if ((scaryTick % 7U) == 0U)
+            {
+                makeSound = 0U;
+            }
+        }
+        // Phase 3: eerie high unstable hold
+        else
+        {
+            tone = highWail[soundPatternIndex];
+            soundPatternIndex++;
+            if (soundPatternIndex >= (sizeof(highWail) / sizeof(highWail[0])))
+            {
+                soundPatternIndex = 0U;
+            }
+
+            if ((scaryTick % 4U) == 1U)
+            {
+                tone += 80U;
+            }
+
+            if ((scaryTick % 6U) == 0U)
+            {
+                makeSound = 0U;
+            }
+        }
+
+        // Output sound for this tick
+        if (makeSound)
+        {
+            Speaker_SetTone(tone);
+            Speaker_On();
         }
         else
         {
-            LED_All_Off();
+            Speaker_Off();
         }
+
+        // Advance scary sound timeline
+        if (scaryTick < 255U)
+        {
+            scaryTick++;
+        }
+    }
+    else
+    {
+        // No sound source is active
+        Speaker_Off();
+        scaryTick = 0U;
+        soundPatternIndex = 0U;
+    }
+
+    // ----------------------------------------------------------
+    // LIGHT FLICKER SECTION
+    // ----------------------------------------------------------
+    if (lightsEnabled)
+    {
+        // Keep LED flicker slower than sound updates
+        flickerTickDivider++;
+        if (flickerTickDivider >= 5U)
+        {
+            flickerTickDivider = 0U;
+            flickerPhaseOn ^= 1U;
+
+            if (flickerPhaseOn)
+            {
+                LED_All_On();
+            }
+            else
+            {
+                LED_All_Off();
+            }
+        }
+    }
+    else
+    {
+        // No light trigger is active, so stop flicker
+        flickerTickDivider = 0U;
+        flickerPhaseOn = 0U;
+
+        // Restore keyboard-controlled letters only
+        LED_ApplyMask(ledStateMask);
     }
 }
 

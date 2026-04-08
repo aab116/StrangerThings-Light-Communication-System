@@ -6,7 +6,7 @@
 
 int main(void)
 {
-    Speaker_Init(1000);      // PA8 speaker, 1 kHz tone
+    Speaker_Init(180);      // PA8 speaker, 1 kHz tone
     Speaker_Off();
 
     PS2_Keyboard_Init();     // PS/2 keyboard + LED control + flicker timer

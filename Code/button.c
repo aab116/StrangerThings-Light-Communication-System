@@ -42,15 +42,8 @@ void EXTI1_IRQHandler(void)
 
         buttonPressed = ((GPIOA->IDR & GPIO_IDR_IDR1) == 0U) ? 1 : 0;
 
-        if (buttonPressed)
-        {
-            Speaker_On();
-            PS2_SetFlickerMode(1U);
-        }
-        else
-        {
-            Speaker_Off();
-            PS2_SetFlickerMode(0U);
-        }
+        /* Let the keyboard/sound module decide whether the overall effect
+           should be on, based on button OR RUN trigger */
+        PS2_SetButtonTrigger((uint8_t)buttonPressed);
     }
 }

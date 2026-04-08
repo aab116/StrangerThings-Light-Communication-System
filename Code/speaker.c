@@ -1,16 +1,55 @@
 #include "speaker.h"
 
-// Stores the CCR1 value that gives approximately 50% duty cycle
-static uint32_t speakerCompareValue = 0;
+// Stores the CCR1 value used for the current duty cycle
+static uint32_t speakerCompareValue = 0U;
 
-void Speaker_Init(uint32_t toneFrequencyHz)
+// Tracks whether sound output is currently enabled
+static uint8_t speakerEnabled = 0U;
+
+// ----------------------------------------------------------
+// Change the PWM tone frequency while TIM1 is running
+// ----------------------------------------------------------
+void Speaker_SetTone(uint32_t toneFrequencyHz)
 {
     uint32_t prescaler;
     uint32_t autoReload;
 
-    // Update system clock variable
+    // Prevent impossible / silly values
+    if (toneFrequencyHz < 100U)
+    {
+        toneFrequencyHz = 100U;
+    }
+
     SystemCoreClockUpdate();
 
+    // Timer clock = 1 MHz
+    prescaler = (SystemCoreClock / 1000000U) - 1U;
+    autoReload = (1000000U / toneFrequencyHz) - 1U;
+
+    TIM1->PSC = prescaler;
+    TIM1->ARR = autoReload;
+
+    // Use about 35% duty cycle instead of 50%
+    // This makes the sound a bit harsher / rougher
+    speakerCompareValue = ((autoReload + 1U) * 20U) / 100U;
+
+    // If speaker is currently ON, keep output active
+    // If OFF, keep silent
+    if (speakerEnabled)
+    {
+        TIM1->CCR1 = speakerCompareValue;
+    }
+    else
+    {
+        TIM1->CCR1 = 0U;
+    }
+
+    // Force registers to reload now
+    TIM1->EGR |= TIM_EGR_UG;
+}
+
+void Speaker_Init(uint32_t toneFrequencyHz)
+{
     // Enable clocks:
     // GPIOA for PA8
     // AFIO for alternate function output
@@ -19,59 +58,29 @@ void Speaker_Init(uint32_t toneFrequencyHz)
     RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
 
-    // -----------------------------------------
-    // Configure PA8 as Alternate Function Push-Pull
-    //
-    // PA8 is controlled by GPIOA->CRH
-    // MODE8 = 10 -> output, max speed 2 MHz
-    // CNF8  = 10 -> alternate function push-pull
-    // -----------------------------------------
+    // PA8 = alternate function push-pull, 2 MHz
     GPIOA->CRH &= ~(GPIO_CRH_MODE8 | GPIO_CRH_CNF8);
     GPIOA->CRH |= GPIO_CRH_MODE8_1 | GPIO_CRH_CNF8_1;
 
-    // -----------------------------------------
-    // Set up TIM1 base frequency
-    //
-    // Make timer count at 1 MHz:
-    // PSC = (SystemCoreClock / 1,000,000) - 1
-    //
-    // Then:
-    // ARR = (1,000,000 / toneFrequencyHz) - 1
-    // -----------------------------------------
-    prescaler = (SystemCoreClock / 1000000U) - 1U;
-    autoReload = (1000000U / toneFrequencyHz) - 1U;
-
-    TIM1->PSC = prescaler;
-    TIM1->ARR = autoReload;
-
-    // 50% duty cycle compare value
-    speakerCompareValue = (autoReload + 1U) / 2U;
-
-    // Start with output OFF
-    TIM1->CCR1 = 0U;
-
-    // -----------------------------------------
-    // Configure TIM1 Channel 1 as PWM Mode 1
-    //
-    // CC1S = 00 -> output
-    // OC1M = 110 -> PWM mode 1
-    // OC1PE = 1 -> preload enable
-    // -----------------------------------------
+    // TIM1 CH1 = PWM mode 1, preload enabled
     TIM1->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_OC1M);
     TIM1->CCMR1 |= TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2;
     TIM1->CCMR1 |= TIM_CCMR1_OC1PE;
 
-    // Enable TIM1 Channel 1 output
+    // Enable channel output
     TIM1->CCER |= TIM_CCER_CC1E;
 
-    // Enable auto-reload preload
+    // Enable ARR preload
     TIM1->CR1 |= TIM_CR1_ARPE;
 
-    // TIM1 is an advanced-control timer, so MOE must be set
+    // Advanced timer main output enable
     TIM1->BDTR |= TIM_BDTR_MOE;
 
-    // Load registers immediately
-    TIM1->EGR |= TIM_EGR_UG;
+    // Start in OFF state
+    speakerEnabled = 0U;
+
+    // Set initial tone
+    Speaker_SetTone(toneFrequencyHz);
 
     // Start timer
     TIM1->CR1 |= TIM_CR1_CEN;
@@ -79,12 +88,12 @@ void Speaker_Init(uint32_t toneFrequencyHz)
 
 void Speaker_On(void)
 {
-    // Apply 50% duty cycle so PA8 outputs the tone
+    speakerEnabled = 1U;
     TIM1->CCR1 = speakerCompareValue;
 }
 
 void Speaker_Off(void)
 {
-    // 0% duty cycle = silent output
+    speakerEnabled = 0U;
     TIM1->CCR1 = 0U;
 }

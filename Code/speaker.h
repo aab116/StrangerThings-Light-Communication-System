@@ -13,4 +13,6 @@ void Speaker_On(void);
 // Turns the tone off
 void Speaker_Off(void);
 
+void Speaker_SetTone(uint32_t toneFrequencyHz);
+
 #endif
